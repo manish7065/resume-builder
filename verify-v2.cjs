@@ -1,0 +1,84 @@
+const {chromium}=require('/Users/manu/.cache/codex-runtimes/codex-primary-runtime/dependencies/node/node_modules/playwright');
+const assert=require('node:assert/strict');
+const fs=require('node:fs/promises');
+const path=require('node:path');
+(async()=>{
+  const browser=await chromium.launch({channel:'chrome',headless:true});
+  try{
+    const page=await browser.newPage({viewport:{width:1440,height:1100}}),errors=[];
+    page.on('pageerror',e=>errors.push(e.message));page.on('dialog',d=>d.accept());
+    await page.goto('http://127.0.0.1:8765');
+    const pause=()=>page.waitForTimeout(250);
+    const saved=()=>page.evaluate(()=>JSON.parse(localStorage.getItem('coforge-resume-v2')));
+    const open=async locator=>{if(!await locator.evaluate(n=>n.open))await locator.locator(':scope > summary').click();};
+    const bounds=async()=>{
+      const values=await page.locator('.page-content').evaluateAll(nodes=>nodes.map(n=>({height:n.clientHeight,scroll:n.scrollHeight,width:n.clientWidth,scrollWidth:n.scrollWidth})));
+      assert(values.every(n=>n.scroll<=n.height+1&&n.scrollWidth<=n.width+1),JSON.stringify(values));return values.length;
+    };
+    const section=title=>page.locator('.section-editor').filter({has:page.locator(':scope > summary .disclosure-title',{hasText:title})});
+    const initialPages=await bounds();
+    await page.screenshot({path:__dirname+'/tmp/v2-app.png'});
+    await page.locator('.resume-page').nth(1).screenshot({path:__dirname+'/tmp/v2-projects.png'});
+    // Migrate an existing v1 draft without changing its contents.
+    await page.evaluate(()=>{localStorage.setItem('coforge-resume-v1',JSON.stringify({...example,name:'Migration Test'}));localStorage.removeItem('coforge-resume-v2');});
+    await page.reload();assert((await page.locator('.profile-name').textContent()).includes('Migration Test'));
+    const skills=page.locator('.section-editor').nth(2);await open(skills);
+    await skills.locator(':scope > .section-fields > .order-controls').getByRole('button',{name:'Remove',exact:true}).click();
+    assert.equal((await saved()).sections.length,4);await page.getByRole('button',{name:'Undo',exact:true}).click();assert.equal((await saved()).sections.length,5);
+    console.log('Migration, section removal, undo passed');
+    const projects=page.locator('.section-editor').nth(3);await open(projects);const project=projects.locator('.block-editor[data-kind=group]').first();await open(project);
+    const role=project.locator('.block-editor').filter({has:page.locator('summary .disclosure-title',{hasText:/^Role$/})});await open(role);
+    await role.locator(':scope > .block-fields > .order-controls').getByRole('button',{name:'Remove',exact:true}).click();
+    assert(!(await saved()).sections[3].items[0].items.some(b=>b.label==='Role'));
+    await page.getByRole('button',{name:'Undo',exact:true}).click();
+    // Add a custom section, then change content and independent heading/body alignment.
+    await page.getByRole('button',{name:'+ Add section',exact:true}).click();await page.getByRole('button',{name:'Custom section',exact:true}).click();
+    let custom=page.locator('.section-editor').last();await custom.getByLabel('Section title',{exact:true}).fill('Selected achievements');
+    await custom.getByLabel('Text alignment',{exact:true}).selectOption('center');await custom.getByLabel('Heading alignment',{exact:true}).selectOption('right');
+    const paragraph=custom.locator('.block-editor').first();await open(paragraph);await paragraph.getByLabel('Content',{exact:true}).fill('Delivered a secure data platform <script>example</script>.');await pause();
+    assert.equal(await page.locator('.resume-text').last().evaluate(n=>getComputedStyle(n).textAlign),'center');
+    assert.equal(await page.locator('.resume-heading').last().evaluate(n=>getComputedStyle(n).textAlign),'right');
+    assert((await page.locator('.resume-text').last().textContent()).includes('<script>'));
+    const adder=custom.locator(':scope > .section-fields > .block-adder');await adder.getByLabel('Content to add',{exact:true}).selectOption('group');await adder.getByRole('button',{name:'+ Add content',exact:true}).click();
+    let group=custom.locator('.block-editor[data-kind=group]').last();await group.getByLabel('Subsection title',{exact:true}).fill('Awards');
+    let nestedAdder=group.locator(':scope > .block-fields > .block-adder');await nestedAdder.getByLabel('Content to add',{exact:true}).selectOption('row');await nestedAdder.getByRole('button',{name:'+ Add content',exact:true}).click();
+    const row=group.locator('.block-editor[data-kind=row]');await row.getByLabel('Label / heading',{exact:true}).fill('Recognition');await row.getByLabel('Content',{exact:true}).fill('Engineering excellence');
+    await custom.locator(':scope > .section-fields > .order-controls').getByRole('button',{name:'Move section Selected achievements up',exact:true}).click();
+    assert.equal((await saved()).sections[4].title,'Selected achievements');
+    custom=page.locator('.section-editor').nth(4);
+    console.log('Nested subsections, editable rows, ordering, alignment and safe text passed');
+    // Add an arbitrary image block, upload through the actual input, and change its geometry.
+    const customAdder=custom.locator(':scope > .section-fields > .block-adder');await customAdder.getByLabel('Content to add',{exact:true}).selectOption('image');await customAdder.getByRole('button',{name:'+ Add content',exact:true}).click();
+    let imageEditor=custom.locator('.block-editor[data-kind=image]');
+    const fixture=await page.evaluate(()=>{const c=document.createElement('canvas');c.width=320;c.height=160;const x=c.getContext('2d');x.fillStyle='#0c2941';x.fillRect(0,0,320,160);x.fillStyle='#ff5b45';x.fillRect(25,25,100,110);return c.toDataURL('image/png').split(',')[1];});
+    await imageEditor.getByLabel('Upload image',{exact:true}).setInputFiles({name:'sample.png',mimeType:'image/png',buffer:Buffer.from(fixture,'base64')});
+    await page.waitForFunction(()=>document.querySelectorAll('.upload-preview').length===1);
+    await imageEditor.getByLabel('Image caption / description',{exact:true}).fill('Project architecture');
+    await imageEditor.getByLabel('Image position',{exact:true}).selectOption('right');await imageEditor.getByLabel('Image fit',{exact:true}).selectOption('cover');
+    await imageEditor.getByRole('slider',{name:'Image width (mm)',exact:true}).fill('100');await imageEditor.getByRole('slider',{name:'Image height (mm)',exact:true}).fill('60');await pause();
+    assert.equal(await page.locator('#pages img').count(),1);assert.equal(await page.locator('#pages img').evaluate(n=>getComputedStyle(n).objectFit),'cover');await bounds();
+    await page.locator('#pages .resume-image').last().screenshot({path:__dirname+'/tmp/v2-image.png'});
+    await page.getByRole('tab',{name:'Layout & alignment',exact:true}).click();
+    await page.getByRole('slider',{name:'Body font size (pt)',exact:true}).fill('11');await page.getByRole('slider',{name:'Table label width (%)',exact:true}).fill('32');await pause();await bounds();
+    const snapshot=await saved();
+    const downloadPromise=page.waitForEvent('download');await page.getByRole('button',{name:'Export draft',exact:true}).click();const download=await downloadPromise;
+    const exported=JSON.parse(await fs.readFile(await download.path(),'utf8'));assert.deepEqual(exported,snapshot);
+    await page.reload();await pause();assert.equal(await page.locator('#pages img').count(),1);assert.equal((await saved()).sections[4].title,'Selected achievements');
+    await page.locator('#import-data').setInputFiles({name:'saved.json',mimeType:'application/json',buffer:Buffer.from(JSON.stringify(exported))});await pause();
+    const restored=await saved();assert.equal(restored.sections[4].items[2].src,exported.sections[4].items[2].src);assert.equal(restored.settings.labelWidth,32);
+    console.log('Image upload, sizing, fit, draft export/import and persistence passed');
+    custom=page.locator('.section-editor').nth(4);await open(custom);const longText=custom.locator('.block-editor[data-kind=text]').first();await open(longText);
+    const long='Very long text and structured content. '.repeat(500)+'Z'.repeat(6000);
+    await longText.getByLabel('Content',{exact:true}).fill(long);await pause();await bounds();
+    const blockId=(await saved()).sections[4].items[0].id;
+    assert.equal((await page.locator(`[data-block-id="${blockId}"]`).allTextContents()).join(''),long);
+    await page.getByRole('tab',{name:'Layout & alignment',exact:true}).click();
+    await page.getByRole('slider',{name:'Body font size (pt)',exact:true}).fill('13');await page.getByRole('slider',{name:'Line spacing',exact:true}).fill('2.2');await pause();await bounds();
+    await page.setViewportSize({width:390,height:844});assert(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth));
+    await page.screenshot({path:__dirname+'/tmp/v2-mobile.png'});
+    await page.setViewportSize({width:1440,height:1100});await page.emulateMedia({media:'print'});await bounds();assert.equal(await page.locator('.editor').isVisible(),false);assert.equal(await page.locator('#pages img').count(),1);
+    await page.emulateMedia({media:'screen'});await page.evaluate(()=>localStorage.clear());await page.reload();await page.evaluate(()=>scrollTo(0,0));
+    await page.screenshot({path:__dirname+'/tmp/v2-final.png'});await page.locator('.resume-page').first().screenshot({path:__dirname+'/tmp/v2-resume.png'});
+    assert.deepEqual(errors,[]);console.log(JSON.stringify({initialPages,checks:'Migration; sections; nested blocks; remove/undo; reorder; alignment; image upload/resize/fit; layout; export/import; persistence; long text preservation; maximum text spacing; mobile; print visibility; no runtime errors'}));
+  }finally{await browser.close();}
+})().catch(error=>{console.error(error);process.exit(1);});
